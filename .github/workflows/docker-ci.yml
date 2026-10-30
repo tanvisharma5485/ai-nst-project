@@ -72,33 +72,79 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
-      - name: Deploy application on EC2
+      - name: Deploy with automatic rollback
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            set -e
+            set -eu
 
-            echo "Pulling latest Docker image..."
-            sudo docker pull tanvikumari03/ai-nst-project:latest
+            IMAGE="tanvikumari03/ai-nst-project:latest"
+            CONTAINER="ai-nst-app"
+            PREVIOUS="ai-nst-app-previous"
+            BACKUP_IMAGE=""
 
-            echo "Replacing existing container..."
-            sudo docker rm -f ai-nst-app || true
+            echo "Pulling new image..."
+            sudo docker pull "$IMAGE"
 
-            echo "Starting updated application..."
-            sudo docker run -d \
-              --name ai-nst-app \
+            # Remember the image used by the current container.
+            if sudo docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+              BACKUP_IMAGE=$(sudo docker inspect \
+                --format '{{.Image}}' "$CONTAINER")
+            fi
+
+            # Remove any stale backup container.
+            sudo docker rm -f "$PREVIOUS" 2>/dev/null || true
+
+            # Preserve the current container before replacing it.
+            if sudo docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+              sudo docker rename "$CONTAINER" "$PREVIOUS"
+              sudo docker stop "$PREVIOUS" || true
+            fi
+
+            # Start the new version.
+            if ! sudo docker run -d \
+              --name "$CONTAINER" \
               --restart unless-stopped \
               -p 5000:5000 \
-              tanvikumari03/ai-nst-project:latest
+              "$IMAGE"; then
+              echo "New container failed to start."
+            else
+              echo "Waiting for application startup..."
+              sleep 15
 
-            echo "Waiting for application to start..."
-            sleep 10
+              if sudo docker exec "$CONTAINER" \
+                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/', timeout=5)" \
+                && sudo docker inspect \
+                  --format '{{.State.Running}}' "$CONTAINER" | grep -q true; then
+                echo "Deployment successful."
+                sudo docker rm -f "$PREVIOUS" 2>/dev/null || true
+                exit 0
+              fi
 
-            echo "Checking application health..."
-            curl -fsS http://localhost:5000/ > /dev/null
+              echo "Health check failed."
+            fi
 
-            echo "Deployment successful!"
-            sudo docker ps --filter name=ai-nst-app
+            # Roll back to the previous container if one existed.
+            echo "Rolling back deployment..."
+            sudo docker rm -f "$CONTAINER" 2>/dev/null || true
+
+            if sudo docker container inspect "$PREVIOUS" >/dev/null 2>&1; then
+              sudo docker rename "$PREVIOUS" "$CONTAINER"
+              sudo docker start "$CONTAINER"
+
+              if sudo docker exec "$CONTAINER" \
+                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/', timeout=10)"; then
+                echo "Rollback successful. Previous version restored."
+              else
+                echo "WARNING: Previous container restarted but health check failed."
+                exit 1
+              fi
+            else
+              echo "No previous container available to restore."
+              exit 1
+            fi
+
+            exit 1
